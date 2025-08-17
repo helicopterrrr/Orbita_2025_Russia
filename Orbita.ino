@@ -24,10 +24,8 @@ using namespace IntroStratLib;
 #define SERVO_PIN PA4
 #define START_BUTTON PB0
 #define CONC_2 PB1
-#define TEMPERATURE_1_TX PD8
-#define TEMPERATURE_1_RX PD9
-#define TEMPERATURE_2_TX PB13
-#define TEMPERATURE_2_RX PB12
+#define TEMPERATURE_1 PC1
+#define TEMPERATURE_2 PC2_C
 #define IVAN PB10
 #define DELITEL PC3_C 
 #define POT_SERVO PC0 
@@ -53,7 +51,7 @@ const int max_servo = 50; //сколько серве в одну сторону
 struct Dater{
   unsigned long current_time;
   unsigned long time_last_experiment;
-  float temperature[3];
+  float temperature[4];
   float pressure;
   float height;
   float height_last_experiment;
@@ -66,9 +64,12 @@ struct Dater{
   bool parking_position;
   bool startExperiment;
   bool breakdown;
+  bool meet_concev;
+  bool start_working;
 };
 
 void start_new_experiment(Dater * new_data){
+  new_data->breakdown = false;
   while(!(digitalRead(CONC_2) || new_data->servo >= (max_servo - new_data->servo))){
     servo.writeMicroseconds(1000); 
     delay(1600); //Подобрать время хода в одну сторону!!!! (1600 - один оборот)
@@ -83,7 +84,48 @@ void start_new_experiment(Dater * new_data){
   new_data->servo = 0;
 }
 
-bool chance_to_fall(const Dater * data){
+void experiment(int voltage, Dater*new_data){
+  new_data->startExperiment = true;
+
+  //это мы успешно (надеюсь) включаем плату Ивана, у нас будет 5 опорных точек напряжения (10, 8, 6, 4, 2 кВ) 
+  TIM_TypeDef *Instance = (TIM_TypeDef *)pinmap_peripheral(digitalPinToPinName(IVAN), PinMap_PWM);
+  uint32_t channel = STM_PIN_CHANNEL(pinmap_function(digitalPinToPinName(IVAN), PinMap_PWM));
+  HardwareTimer *MyTim = new HardwareTimer(Instance);
+
+  MyTim->setPWM(channel, IVAN, voltage, 100); // 100КГц, 100% - коэффициент заполнения, Иван, какой нужен?
+  new_data->voltage = voltage; //первый прогон на 10кВ
+  new_data->parking_position = false;
+
+  while (!chance_to_fall(new_data) && (analogRead(DELITEL) / new_data->amperage) < 2){ //2 - во сколько раз у нас возрастет ток
+    get_telemetry(new_data);
+
+    servo.writeMicroseconds(1000); 
+    delay(1600); 
+    servo.writeMicroseconds(1500);
+    delay(100);
+    new_data->servo += 1; // увеличиваем количество оборотов сервы 
+        
+    if ((analogRead(DELITEL) / new_data->amperage) > 2){
+      new_data->breakdown = 1;
+      get_telemetry(new_data);
+      sendData(new_data);
+      MyTim->setPWM(channel, IVAN, 0, 0); // отключили напряжение
+      start_new_experiment(new_data); // уехали на исходную точку
+      break;
+    }
+
+    if (chance_to_fall(new_data)){
+      get_telemetry(new_data);
+      sendData(new_data);
+      MyTim->setPWM(channel, IVAN, 0, 0); // отключили напряжение
+      start_new_experiment(new_data); // уехали на исходную точку
+      break;
+    }
+    new_data->amperage = analogRead(DELITEL);
+    sendData(new_data);
+    }
+}
+bool chance_to_fall(Dater * data){
   return (digitalRead(CONC_2) || data->servo >= max_servo); //(или серво сделал 50 оборотов (или сколько там ему в одну сторону))
 }
 
@@ -111,6 +153,17 @@ void get_telemetry(Dater *new_data){
   new_data->pressure = pressure;
   
   new_data->temperature[1] = bar.GetTemperature();
+  int reading = analogRead(TEMPERATURE_1);
+  float voltage = reading * 3.3;
+  voltage /= 1024.0;
+  float temperatureC = (voltage - 0.5) * 100 ;
+  new_data->temperature[2] = temperatureC;
+
+  reading = analogRead(TEMPERATURE_2);
+  voltage = reading * 3.3;
+  voltage /= 1024.0;
+  temperatureC = (voltage - 0.5) * 100 ;
+  new_data->temperature[3] = temperatureC;
 
   float height = ((8.31 * (temperature + 273)) / (0.029 * 9.81)) * (log(760 / pressure));
 
@@ -128,12 +181,14 @@ void get_telemetry(Dater *new_data){
 
 }
 
-String createStringToData(const Dater * data){
+String createStringToData(Dater * data){
   String result = "";
   result += String(data->current_time, 10) + '\t';
   result += String(data->time_last_experiment, 10) + '\t';
   result += String(data->temperature[0], 2) + '\t';
   result += String(data->temperature[1], 2) + '\t';
+  result += String(data->temperature[2], 2) + '\t';
+  result += String(data->temperature[3], 2) + '\t';
   result += String(data->pressure, 2) + '\t';
   result += String(data->height, 2) + '\t';
   result += String(data->height_last_experiment) + '\t';
@@ -168,13 +223,13 @@ void sendUART(String text){
     Serialx.println(text);
 }
 
-void sendTextFormat(const Dater * data){
+void sendTextFormat(Dater * data){
     String text = createStringToData(data);
     saveSD(text);
     sendUART(text);
 }
 
-void sendData(const Dater * data){
+void sendData(Dater * data){
     sendTextFormat(data);
 }
 
@@ -184,6 +239,7 @@ unsigned long time_from_last_experiment = 0;
 unsigned long height_from_last_experiment = 0;
 
 void setup() {
+  pinMode(START_BUTTON, INPUT);
   SD.setDx(PC8, PC9, PC10, PC11);
   SD.setCMD(PD2);
   SD.setCK(PC12);
@@ -192,7 +248,6 @@ void setup() {
   pinMode(DELITEL, INPUT);
   pinMode(POT_SERVO, INPUT);
   pinMode(CONC_2, INPUT);
-  pinMode(START_BUTTON, INPUT);
   Wirex.begin();
   Wirex2.begin();
   servo.attach(SERVO_PIN);
@@ -204,15 +259,17 @@ void setup() {
   while (!SD.begin());
 
   //заклинания для настройки таймера на определенную частоту шим
+
+  new_data.servo = analogRead(POT_SERVO);
+  while(!digitalRead(START_BUTTON)){
+    get_telemetry(&new_data);
+    sendData(&new_data);
+    delay(2000);
+  }
   TIM_TypeDef *Instance = (TIM_TypeDef *)pinmap_peripheral(digitalPinToPinName(IVAN), PinMap_PWM);
   uint32_t channel = STM_PIN_CHANNEL(pinmap_function(digitalPinToPinName(IVAN), PinMap_PWM));
   HardwareTimer *MyTim = new HardwareTimer(Instance);
   MyTim->setPWM(channel, IVAN, 0, 0);
-
-  get_telemetry(&new_data);
-
-  new_data.servo = analogRead(POT_SERVO);
-
   first_check(&new_data);
   sendData(&new_data);
 }
@@ -221,187 +278,25 @@ void loop() {
   get_telemetry(&new_data);
   time_from_last_experiment = new_data.current_time - new_data.time_last_experiment;
   height_from_last_experiment = new_data.height - new_data.height_last_experiment; 
-
-  int reading = analogRead(TEMPERATURE_1_RX);
-  float voltage = reading * 5;
-  voltage /= 1024.0;
-  float temperatureC = (voltage - 0.5) * 100 ;
-  Serialx.print(analogRead(PD8));
-  Serialx.print(' ');
   sendData(&new_data);
+
   Serialx.print(digitalRead(CONC_2));
   Serialx.print(' ');
   Serialx.print(digitalRead(START_BUTTON));
   Serialx.println(' ');
   delay(2000);
-  /*
+  
   if (time_from_last_experiment >= 4 * 60 * 1000 || height_from_last_experiment >= 1500){
       new_data.startExperiment = true;
-
-      //это мы успешно (надеюсь) включаем плату Ивана, у нас будет 5 опорных точек напряжения (10, 8, 6, 4, 2 кВ) 
-      TIM_TypeDef *Instance = (TIM_TypeDef *)pinmap_peripheral(digitalPinToPinName(IVAN), PinMap_PWM);
-      uint32_t channel = STM_PIN_CHANNEL(pinmap_function(digitalPinToPinName(IVAN), PinMap_PWM));
-      HardwareTimer *MyTim = new HardwareTimer(Instance);
-
-      MyTim->setPWM(channel, IVAN, 100000, 100); // 100КГц, 100% - коэффициент заполнения, Иван, какой нужен?
-      new_data.voltage = 10; //первый прогон на 10кВ
-      new_data.parking_position = false;
-
-      while (!chance_to_fall(&new_data) && (analogRead(DELITEL) / new_data.amperage) < 2){ //2 - во сколько раз у нас возрастет ток
-        get_telemetry(&new_data);
-
-        servo.writeMicroseconds(1000); 
-        delay(1600); 
-        servo.writeMicroseconds(1500);
-        delay(100);
-        new_data.servo += 1; // увеличиваем количество оборотов сервы 
-        
-        if ((analogRead(DELITEL) / new_data.amperage) > 2){
-          new_data.breakdown = 1;
-          get_telemetry(&new_data);
-          sendData(&new_data);
-          MyTim->setPWM(channel, IVAN, 0, 0); // отключили напряжение
-          start_new_experiment(); // уехали на исходную точку
-          break;
-        }
-
-        if (chance_to_fall(&new_data)){
-          get_telemetry(&new_data);
-          sendData(&new_data);
-          MyTim->setPWM(channel, IVAN, 0, 0); // отключили напряжение
-          start_new_experiment(&new_data); // уехали на исходную точку
-          break;
-        }
-        sendData(&new_data);
-      }
-      MyTim->setPWM(channel, IVAN, 100000, 100); // 100КГц, 100% - коэффициент заполнения, Иван, какой нужен?
-      new_data.voltage = 8; 
-      new_data.parking_position = false;
-
-      while (!chance_to_fall(&new_data) && (analogRead(DELITEL) / new_data.amperage) < 2){ //2 - во сколько раз у нас возрастет ток
-        get_telemetry(&new_data);
-
-        servo.writeMicroseconds(1000); 
-        delay(1600); 
-        servo.writeMicroseconds(1500);
-        delay(100);
-        new_data.servo += 1; // увеличиваем количество оборотов сервы 
-        
-        if (analogRead(DELITEL) / new_data.amperage) > 2{
-          new_data.breakdown = 1;
-          get_telemetry(&new_data);
-          sendData(&new_data);
-          MyTim->setPWM(channel, IVAN, 0, 0); // отключили напряжение
-          start_new_experiment(); // уехали на исходную точку
-          break;
-        }
-
-        if (chance_to_fall(&new_data)){
-          get_telemetry(&new_data);
-          sendData(&new_data);
-          MyTim->setPWM(channel, IVAN, 0, 0); // отключили напряжение
-          start_new_experiment(); // уехали на исходную точку
-          break;
-        }
-        sendData(&new_data);
-      }
-
-      MyTim->setPWM(channel, IVAN, 100000, 100); // 100КГц, 100% - коэффициент заполнения, Иван, какой нужен?
-      new_data.voltage = 6; 
-      new_data->parking_position = false;
-
-      while (!chance_to_fall(&new_data) && (analogRead(DELITEL) / new_data.amperage) < 2){ //2 - во сколько раз у нас возрастет ток
-        get_telemetry(&new_data);
-
-        servo.writeMicroseconds(1000); 
-        delay(1600); 
-        servo.writeMicroseconds(1500);
-        delay(100);
-        new_data.servo += 1; // увеличиваем количество оборотов сервы 
-        
-        if (analogRead(DELITEL) / new_data.amperage) > 2{
-          new_data.breakdown = 1;
-          get_telemetry(&new_data);
-          sendData(&new_data);
-          MyTim->setPWM(channel, IVAN, 0, 0); // отключили напряжение
-          start_new_experiment(); // уехали на исходную точку
-          break;
-        }
-
-        if (chance_to_fall(&new_data)){
-          get_telemetry(&new_data);
-          sendData(&new_data);
-          MyTim->setPWM(channel, IVAN, 0, 0); // отключили напряжение
-          start_new_experiment(); // уехали на исходную точку
-          break;
-        }
-        sendData(&new_data);
-      }
-
-      MyTim->setPWM(channel, IVAN, 100000, 100); // 100КГц, 100% - коэффициент заполнения, Иван, какой нужен?
-      new_data.voltage = 4; 
-      new_data->parking_position = false;
-
-      while (!chance_to_fall(&new_data) && (analogRead(DELITEL) / new_data.amperage) < 2){ //2 - во сколько раз у нас возрастет ток
-        get_telemetry(&new_data);
-
-        servo.writeMicroseconds(1000); 
-        delay(1600); 
-        servo.writeMicroseconds(1500);
-        delay(100);
-        new_data.servo += 1; // увеличиваем количество оборотов сервы 
-        
-        if (analogRead(DELITEL) / new_data.amperage) > 2{
-          new_data.breakdown = 1;
-          get_telemetry(&new_data);
-          sendData(&new_data);
-          MyTim->setPWM(channel, IVAN, 0, 0); // отключили напряжение
-          start_new_experiment(); // уехали на исходную точку
-          break;
-        }
-
-        if (chance_to_fall(&new_data)){
-          get_telemetry(&new_data);
-          sendData(&new_data);
-          MyTim->setPWM(channel, IVAN, 0, 0); // отключили напряжение
-          start_new_experiment(); // уехали на исходную точку
-          break;
-        }
-        sendData(&new_data);
-      }
-
-      MyTim->setPWM(channel, IVAN, 100000, 100); // 100КГц, 100% - коэффициент заполнения, Иван, какой нужен?
-      new_data.voltage = 2; //первый прогон на 10кВ
-      new_data->parking_position = false;
-
-     while (!chance_to_fall(&new_data) && (analogRead(DELITEL) / new_data.amperage) < 2){ //2 - во сколько раз у нас возрастет ток
-        get_telemetry(&new_data);
-
-        servo.writeMicroseconds(1000); 
-        delay(1600); 
-        servo.writeMicroseconds(1500);
-        delay(100);
-        new_data.servo += 1; // увеличиваем количество оборотов сервы 
-        
-        if (analogRead(DELITEL) / new_data.amperage) > 2{
-          new_data.breakdown = 1;
-          get_telemetry(&new_data);
-          sendData(&new_data);
-          MyTim->setPWM(channel, IVAN, 0, 0); // отключили напряжение
-          start_new_experiment(); // уехали на исходную точку
-          break;
-        }
-
-        if (chance_to_fall(&new_data)){
-          get_telemetry(&new_data);
-          sendData(&new_data);
-          MyTim->setPWM(channel, IVAN, 0, 0); // отключили напряжение
-          start_new_experiment(); // уехали на исходную точку
-          break;
-        }
-        sendData(&new_data);
-      }
+      experiment(10000, &new_data);
+      experiment(8000, &new_data);
+      experiment(6000, &new_data);
+      experiment(4000, &new_data);
+      experiment(2000, &new_data);
+      get_telemetry(&new_data);
+      new_data.height_last_experiment = new_data.height;
       new_data.time_last_experiment = millis();
+      new_data.startExperiment = false;
+      sendData(&new_data);
   }
-  */
 }
