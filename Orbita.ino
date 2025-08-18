@@ -47,7 +47,7 @@ LM75A temp(Wirex, 0x4A);
 
 File dataFile;
 
-const int max_servo = 50; //сколько серве в одну сторону
+const int max_servo = 61; //сколько серве в одну сторону
 struct Dater{
   unsigned long current_time;
   unsigned long time_last_experiment;
@@ -70,23 +70,29 @@ struct Dater{
 
 void start_new_experiment(Dater * new_data){
   new_data->breakdown = false;
-  while(!(digitalRead(CONC_2) || new_data->servo >= (max_servo - new_data->servo))){
-    servo.writeMicroseconds(1000); 
-    delay(1600); //Подобрать время хода в одну сторону!!!! (1600 - один оборот)
-    servo.writeMicroseconds(1500);
-    delay(100);
-  }
-  servo.writeMicroseconds(2000); 
-  delay(1600 * max_servo); //Подобрать время хода в одну сторону!!!! (1600 - один оборот)
+  servo.writeMicroseconds(1500);
+  delay(100);
+  servo.writeMicroseconds(1000); 
+  delay(1600); //Подобрать время хода в одну сторону!!!! (1600 - один оборот)
   servo.writeMicroseconds(1500);
   delay(100);
   new_data->parking_position = true;
   new_data->servo = 0;
+  while(!chance_to_fall(new_data)){
+    servo.writeMicroseconds(2000); 
+    delay(1600); //Подобрать время хода в одну сторону!!!! (1600 - один оборот)
+    servo.writeMicroseconds(1500);
+    delay(10);
+  }
 }
 
 void experiment(int voltage, Dater*new_data){
   new_data->startExperiment = true;
 
+  servo.writeMicroseconds(1000);
+  delay(6 * 1600);
+  servo.writeMicroseconds(1500);
+  delay(1000);
   //это мы успешно (надеюсь) включаем плату Ивана, у нас будет 5 опорных точек напряжения (10, 8, 6, 4, 2 кВ) 
   TIM_TypeDef *Instance = (TIM_TypeDef *)pinmap_peripheral(digitalPinToPinName(IVAN), PinMap_PWM);
   uint32_t channel = STM_PIN_CHANNEL(pinmap_function(digitalPinToPinName(IVAN), PinMap_PWM));
@@ -96,15 +102,16 @@ void experiment(int voltage, Dater*new_data){
   new_data->voltage = voltage; //первый прогон на 10кВ
   new_data->parking_position = false;
 
-  while (!chance_to_fall(new_data) && (analogRead(DELITEL) / new_data->amperage) < 2){ //2 - во сколько раз у нас возрастет ток
+  while (!chance_to_fall(new_data)){ //  && (analogRead(DELITEL) / new_data->amperage) < 2 2 - во сколько раз у нас возрастет ток
     get_telemetry(new_data);
 
-    servo.writeMicroseconds(1000); 
+    servo.writeMicroseconds(2000); 
     delay(1600); 
     servo.writeMicroseconds(1500);
-    delay(100);
+    delay(10);
     new_data->servo += 1; // увеличиваем количество оборотов сервы 
-        
+
+    /* 
     if ((analogRead(DELITEL) / new_data->amperage) > 2){
       new_data->breakdown = 1;
       get_telemetry(new_data);
@@ -113,12 +120,15 @@ void experiment(int voltage, Dater*new_data){
       start_new_experiment(new_data); // уехали на исходную точку
       break;
     }
+    */ 
 
     if (chance_to_fall(new_data)){
+      Serialx.println("dhfhdjhfdjgjdfkgkj");
       get_telemetry(new_data);
       sendData(new_data);
       MyTim->setPWM(channel, IVAN, 0, 0); // отключили напряжение
       start_new_experiment(new_data); // уехали на исходную точку
+      Serialx.println("dhfhdjhfdjgjdfkgkj");
       break;
     }
     new_data->amperage = analogRead(DELITEL);
@@ -126,18 +136,31 @@ void experiment(int voltage, Dater*new_data){
     }
 }
 bool chance_to_fall(Dater * data){
-  return (digitalRead(CONC_2) || data->servo >= max_servo); //(или серво сделал 50 оборотов (или сколько там ему в одну сторону))
+  return (!digitalRead(CONC_2)); // (или серво сделал 50 оборотов (или сколько там ему в одну сторону))
 }
 
-void first_check(Dater *data){
-  servo.writeMicroseconds(1000); 
-  delay(1600); //Подобрать время хода в одну сторону!!!! (1600 - один оборот)
+void first_check(Dater * new_data){
+  int one_turn = 0;
+  while (!chance_to_fall(new_data)){
+    servo.writeMicroseconds(2000); 
+    delay(1600); //Подобрать время хода в одну сторону!!!! (1600 - один оборот)
+    servo.writeMicroseconds(1500);
+    delay(10);
+    one_turn += 1;
+  }
+
+  servo.writeMicroseconds(1000);
+  delay(1600 * 60);
   servo.writeMicroseconds(1500);
   delay(1000);
-  servo.writeMicroseconds(2000);
-  delay(1600);
-  servo.writeMicroseconds(1500);
-  delay(1000);
+
+  while (!chance_to_fall(new_data)){
+    servo.writeMicroseconds(2000); 
+    delay(1600); //Подобрать время хода в одну сторону!!!! (1600 - один оборот)
+    servo.writeMicroseconds(1500);
+    delay(10);
+    one_turn += 1;
+  }
   sendUART("Electrods have just checked");
   saveSD("Electrods have just checked");
 }
@@ -179,6 +202,7 @@ void get_telemetry(Dater *new_data){
   new_data->gyro[1] = gacc.GY();
   new_data->gyro[2] = gacc.GZ();
 
+  new_data->meet_concev = digitalRead(CONC_2);
 }
 
 String createStringToData(Dater * data){
@@ -204,6 +228,8 @@ String createStringToData(Dater * data){
   result += String(data->voltage, 2) + '\t';
   result += String(data->amperage, 2) + '\t';
   result += String(data->servo, 2) + '\t';
+  result += String(data->breakdown, 2) + '\t';
+  result += String(data->meet_concev, 2) + '\t';
   result += String(data->startExperiment);
   return result;
 }
@@ -270,7 +296,7 @@ void setup() {
   uint32_t channel = STM_PIN_CHANNEL(pinmap_function(digitalPinToPinName(IVAN), PinMap_PWM));
   HardwareTimer *MyTim = new HardwareTimer(Instance);
   MyTim->setPWM(channel, IVAN, 0, 0);
-  first_check(&new_data);
+  //first_check(&new_data);
   sendData(&new_data);
 }
 
@@ -280,19 +306,17 @@ void loop() {
   height_from_last_experiment = new_data.height - new_data.height_last_experiment; 
   sendData(&new_data);
 
-  Serialx.print(digitalRead(CONC_2));
-  Serialx.print(' ');
-  Serialx.print(digitalRead(START_BUTTON));
-  Serialx.println(' ');
-  delay(2000);
-  
-  if (time_from_last_experiment >= 4 * 60 * 1000 || height_from_last_experiment >= 1500){
+  if (time_from_last_experiment >= 60 * 1000 || height_from_last_experiment >= 1500){
       new_data.startExperiment = true;
+      get_telemetry(&new_data);
+      sendData(&new_data);
+
       experiment(10000, &new_data);
       experiment(8000, &new_data);
       experiment(6000, &new_data);
       experiment(4000, &new_data);
       experiment(2000, &new_data);
+
       get_telemetry(&new_data);
       new_data.height_last_experiment = new_data.height;
       new_data.time_last_experiment = millis();
